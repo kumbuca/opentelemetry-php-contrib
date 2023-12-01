@@ -6,6 +6,8 @@ namespace OpenTelemetry\Contrib\Instrumentation\Laravel;
 
 use Illuminate\Console\Command;
 use Illuminate\Contracts\Console\Kernel;
+use Illuminate\Queue\Jobs\Job;
+use Illuminate\Queue\Jobs\JobName;
 use OpenTelemetry\API\Instrumentation\CachedInstrumentation;
 use OpenTelemetry\API\Trace\Span;
 use OpenTelemetry\API\Trace\SpanKind;
@@ -92,6 +94,50 @@ class ConsoleInstrumentation
                 if ($exception) {
                     $span->recordException($exception, [TraceAttributes::EXCEPTION_ESCAPED => true]);
                     $span->setStatus(StatusCode::STATUS_ERROR, $exception->getMessage());
+                }
+
+                $span->end();
+            }
+        );
+
+        hook(
+            Job::class,
+            'fire',
+            pre: static function (Job $job, array $params, string $class, string $function, ?string $filename, ?int $lineno) use ($instrumentation) {
+                $jobName = JobName::resolve($job->getName(), $job->payload()) ?: 'unknown';
+
+                /** @psalm-suppress ArgumentTypeCoercion */
+                $builder = $instrumentation->tracer()
+                    ->spanBuilder(sprintf('Job %s', $jobName))
+                    ->setParent(false)
+                    ->setSpanKind(SpanKind::KIND_CONSUMER)
+                    ->setAttribute(TraceAttributes::CODE_FUNCTION, $function)
+                    ->setAttribute(TraceAttributes::CODE_NAMESPACE, $jobName)
+                    ->setAttribute(TraceAttributes::CODE_FILEPATH, $filename)
+                    ->setAttribute(TraceAttributes::CODE_LINENO, $lineno);
+
+                $parent = Context::getCurrent();
+                $span = $builder->startSpan();
+                Context::storage()->attach($span->storeInContext($parent));
+
+                return $params;
+            },
+            post: static function (Job $job, array $params, ?int $exitCode, ?Throwable $exception) {
+                $scope = Context::storage()->scope();
+                if (!$scope) {
+                    return;
+                }
+
+                $scope->detach();
+                $span = Span::fromContext($scope->context());
+
+                if ($exception) {
+                    $span->recordException($exception, [TraceAttributes::EXCEPTION_ESCAPED => true]);
+                    $span->setStatus(StatusCode::STATUS_ERROR, $exception->getMessage());
+                } elseif ($job->hasFailed()) {
+                    $span->setStatus(StatusCode::STATUS_ERROR);
+                } else {
+                    $span->setStatus(StatusCode::STATUS_OK);
                 }
 
                 $span->end();
